@@ -1,0 +1,12 @@
+datasets/
+intermediate_output/
+runs/
+train_log/
+logs/
+weights/
+*.pyc
+*.pyo
+*.pt
+*.npy
+*.npz
+__pycache__/
