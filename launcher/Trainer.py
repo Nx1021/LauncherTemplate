@@ -260,6 +260,8 @@ class Trainer(Launcher, abc.ABC):
         self.start_epoch = start_epoch
         self.save_period = save_period
 
+        self.collate_fn = None
+
     @property
     def skip(self):
         return self.cur_epoch < self.start_epoch
@@ -337,8 +339,8 @@ class Trainer(Launcher, abc.ABC):
     def train(self):
         print("start to train... time:{}".format(self.start_timestamp))
         self.cur_epoch = 0
-        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, collate_fn=collate_fn)
-        val_dataloader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, collate_fn=collate_fn)
+        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,  collate_fn=self.collate_fn)
+        val_dataloader   = DataLoader(self.val_dataset,   batch_size=self.batch_size, shuffle=False, collate_fn=self.collate_fn)
 
         for epoch in self.flow:
             self.cur_epoch = epoch

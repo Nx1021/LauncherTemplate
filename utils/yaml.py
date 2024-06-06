@@ -1,6 +1,5 @@
 import ruamel.yaml
 import os
-from . import SCRIPT_DIR
 
 loaded_cfg = {}
 
