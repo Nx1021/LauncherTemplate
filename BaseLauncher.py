@@ -1,4 +1,4 @@
-from . import LOGS_DIR, _get_sub_log_dir
+from . import LOGS_DIR, _get_sub_log_dir, dump_yaml, load_yaml
 
 import torch
 import sys
@@ -8,7 +8,6 @@ import platform
 import os
 import shutil
 import datetime
-from utils.yaml import dump_yaml, load_yaml
 import pandas as pd
 import time
 

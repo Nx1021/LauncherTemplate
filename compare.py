@@ -1,8 +1,7 @@
-from . import LOGS_DIR, _get_sub_log_dir
+from . import LOGS_DIR, _get_sub_log_dir, dump_yaml, load_yaml
 from .Trainer import Trainer
 
 import os
-from utils.yaml import dump_yaml, load_yaml
 import pandas as pd
 
 def compare_train_log(sub_dirs):

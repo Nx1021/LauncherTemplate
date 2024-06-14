@@ -1,4 +1,5 @@
-from . import SCRIPT_DIR, WEIGHTS_DIR
+from . import SCRIPT_DIR, WEIGHTS_DIR, load_yaml
+from .BaseLauncher import BaseLogger, Launcher
 
 import os
 import torch
@@ -13,8 +14,6 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 
 import numpy as np
-from .BaseLauncher import BaseLogger, Launcher
-from utils.yaml import load_yaml
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import datetime
@@ -31,14 +30,23 @@ if sys_name == "Windows":
 else:
     TESTFLOW = False
 
+class TrainFlowKW(TypedDict):
+    lr_func: str
+    lr: float
+    cfg: dict
+
 class TrainFlow():
     '''
     训练流程
     '''
-    def __init__(self, trainer:"Trainer", flowfile) -> None:
+    def __init__(self, trainer:"Trainer", flowfile:str|dict[int, TrainFlowKW]) -> None:
         self.trainer = trainer
         self.epoch = 0
-        self.flow:dict = load_yaml(flowfile, False)
+        if isinstance(flowfile, dict):
+            self.flow:dict[int, TrainFlowKW] = flowfile
+        else:
+            assert os.path.exists(flowfile), f"{flowfile} not exists!"
+            self.flow:dict[int, TrainFlowKW] = load_yaml(flowfile)
         self.stage_segment = list(self.flow.keys())
         if self.stage_segment[0] != 0:
             raise ValueError("the first stage must start at epoch 0!")
@@ -47,6 +55,10 @@ class TrainFlow():
     @property
     def cur_stage(self):
         return sum([self.epoch >= x for x in self.stage_segment]) - 1
+
+    @property
+    def total_epoch(self):
+        return list(self.flow.keys())[-1]
 
     def get_lr_func(self, lr_name, totol_step, initial_lr):
         # totol_step = totol_step * int(np.round(len(self.trainer.train_dataset) / self.trainer.batch_size))
@@ -68,10 +80,6 @@ class TrainFlow():
             return
         totol_step = self.stage_segment[self.cur_stage + 1] - self.stage_segment[self.cur_stage]
         self.scheduler = self.get_lr_func(stage_info["lr_func"], totol_step, stage_info["lr"])
-        # self.trainer.optimizer.zero_grad()
-        # self.trainer.optimizer.step()
-        if "cfg" in stage_info:
-            self.trainer.inner_model.cfg.update(stage_info["cfg"])
 
     def __iter__(self):
         return self
@@ -105,118 +113,81 @@ class TrainLogger(BaseLogger):
         with open(log_file, 'a') as f:
             f.write(log_line)
 
+class LossModule(nn.Module):
+    """
+    method `run` and `get_batch_size` must be overrided
+    """
+    def __init__(self, loss_names:list[str], *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.loss_mngr = LossManager(f"Loss-{self.__class__.__name__}", loss_names)
+
+    def run(self, *args, **kwargs) -> tuple[Tensor]:
+        """
+        Return a tuple of losses, each Tensor in the tuple is the average of a specific loss item
+        """
+        pass
+
+    def get_batch_size(self, *args, **kwargs) -> int:
+        pass
+
+    def forward(self, *args, **kwargs):
+        B = self.get_batch_size(*args, **kwargs)
+        losses = self.run(*args, **kwargs)
+        assert len(losses) == len(self.loss_mngr.loss_names), f"losses:{len(losses)} != loss_names:{len(self.loss_mngr.loss_names)}"
+        self.loss_mngr.record(losses, B)
+
+        return torch.sum(torch.stack(losses))
+
 class LossKW(TypedDict):
     LOSS    = "Loss"
-    
-class LossResult():
-    def __init__(self, loss_Tensor:Tensor, item_weights:Tensor, item_names:list[str]) -> None:
-        '''
-        parameter
-        -----
-        * loss_Tensor: Tensor [B, num_items]
-        * item_weights: the weight of each column [num_items]
 
-        len(item_weights) must be equal to loss_Tensor.shape[1]
-        '''
-        assert len(loss_Tensor.shape) == 2, "loss_Tensor must be 2D"
-        assert len(item_weights.shape) == 1 and item_weights.numel() == len(item_names) == loss_Tensor.shape[1] 
-        self.loss_Tensor = loss_Tensor
-        self.item_weights = item_weights.to(loss_Tensor.device)
-        self.item_names = item_names
-
-    def apply_weight(self):
-        if self.valid:
-            loss_Tensor = self.loss_Tensor * self.item_weights # [B, num_items]
-            return loss_Tensor
-        else:
-            return self.loss_Tensor
-
-    def loss(self) -> Tensor:
-        if self.valid:
-            loss_Tensor = self.apply_weight() # [B, num_items]
-            loss = torch.mean(torch.sum(loss_Tensor, dim=-1)) # [1] 
-            return loss
-        else:
-            return torch.Tensor([0.0]).to(self.loss_Tensor.device) # [1] 
-
-    @property
-    def valid(self):
-        return self.loss_Tensor.numel() != 0
-
-    @property
-    def B(self):
-        return self.loss_Tensor.shape[0]
-
-    @property
-    def num_items(self):
-        return self.loss_Tensor.shape[1]
-
-    def to_dict(self) -> dict:
-        dict_ = {}
-        if self.valid:
-            loss_Tensor:np.ndarray = self.apply_weight().detach().cpu().numpy()
-            item_losses = np.mean(loss_Tensor, (0, 1))
-            for name, v in zip(self.item_names, item_losses):
-                dict_[name] = float(v)
-            dict_[LossKW.LOSS]   = float(np.mean(np.sum(loss_Tensor, -1)))
-        return dict_
-
-    @staticmethod
-    def concat(result_list: list["LossResult"]):
-        if len(result_list) > 0:
-            item_weights: Tensor    = result_list[0].item_weights
-            item_names: list[str]   = result_list[0].item_names
-
-            concat = torch.concat([r.loss_Tensor for r in result_list])
-
-            return LossResult(concat, item_weights, item_names)
-        else:
-            return LossResult(torch.zeros(0,0,0), None, None)
-
-class LossRecorder():
-    def __init__(self, name, top = True) -> None:
+class LossManager():
+    '''
+    记录总损失
+    添加每一个batch的损失
+    '''
+    def __init__(self, name:str, loss_names:tuple[str]) -> None:
         self.name = name
         self.loss_sum:Tensor = torch.Tensor([0.0])
         self.loss_record:dict[float] = {}
+        self.loss_names = loss_names
         self.loss_record[LossKW.LOSS] = 0.0
-        self.detect_num:int = 0
-        if top:
-            self.buffer = LossRecorder("__buffer", top=False)
+        self._total_num:int = 0
+        self._last_loss = 0.0
 
-    def record(self, result:LossResult):
-        for key, value in result.to_dict().items():
-            self.buffer.loss_record.setdefault(key, 0.0)
-            self.buffer.loss_record[key] += value * result.B
-        self.buffer.detect_num += result.B
+    @property
+    def loss(self):
+        return self.loss_record[LossKW.LOSS]
+    
+    @property
+    def last_loss(self):
+        return self._last_loss
+
+    def record(self, losses:tuple[Tensor], num:int):
+        self._last_loss = torch.sum(torch.stack(losses)).item()
+        for key, value in zip(self.loss_names, losses):
+            self.loss_record.setdefault(key, 0.0)            
+            new_losss = (self.loss_record[key] * self._total_num + value * num) / (self._total_num + num)
+            self.loss_record[key] = new_losss
+        self._total_num += num
 
     def clear(self):
-        self.loss_sum = torch.Tensor([0.0])
-        self.loss_record.clear()
-        self.loss_record[LossKW.LOSS] = 0.0
-        self.detect_num = 0
+        self.loss_sum[:] = 0
+        for k in self.loss_record:
+            self.loss_record[k] = 0.0
+        self._total_num = 0
 
-    def loss(self):
-        return self.__get_mean(self.loss_record[LossKW.LOSS])
+class TrainerConfig(TypedDict):
+    device:str = "cuda"
 
-    def __get_mean(self, value:float):
-        if self.detect_num == 0:
-            return 0.0
-        else:
-            return value / self.detect_num
+    batch_size:int = 8
 
-    def to_dict(self):
-        dict_:dict[str, float] = {}
-        for key, sum_value in self.loss_record.items():
-            dict_[self.name + ' ' + key] = self.__get_mean(sum_value)
+    start_epoch:int = 0
+    train_flow:dict[int, TrainFlowKW] = {}
+    distributed:bool = False
 
-        return dict_
-
-    def merge(self):
-        buffer = self.buffer
-        self.detect_num += buffer.detect_num
-        for key, value in buffer.loss_record.items():
-            self.loss_record.setdefault(key, 0.0)
-            self.loss_record[key] += value
+    # saving
+    saving_period:int = 400
 
 _TEST_TRAINER_ = False
 
@@ -225,30 +196,27 @@ class Trainer(Launcher, abc.ABC):
                  model:nn.Module,
                  train_dataset,
                  val_dataset,
-                 criterion,
-                 batch_size,
-                 flow_file = "",
-                 distribute = False,
-                 start_epoch = 0,
-                 save_period = 400):
-        super().__init__(model, batch_size)
+                 criterion: LossModule,
+                 config:TrainerConfig):
+        super().__init__(model, config["batch_size"])
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
+        self.config = config
 
-        self.flow = TrainFlow(self, flow_file)
-        self.distribute = distribute
+        self.flow = TrainFlow(self, config["train_flow"])
+        self.distributed = config["distributed"]
 
-        if self.distribute:
+        if self.distributed:
             # 初始化分布式环境
             dist.init_process_group(backend='nccl', init_method='tcp://localhost:23456', world_size=torch.cuda.device_count(), rank=torch.cuda.current_device())
             self.model = torch.nn.parallel.DistributedDataParallel(self.model)
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(config["device"])
         self.model = self.model.to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters())  # 初始化优化器
-        self.criterion:nn.Module = criterion
+        self.criterion:LossModule = criterion
 
         self.best_val_loss = float('inf')  # 初始化最佳验证损失为正无穷大
 
@@ -257,8 +225,8 @@ class Trainer(Launcher, abc.ABC):
             self.logger = TrainLogger(self.log_dir)
 
         self.cur_epoch = 0
-        self.start_epoch = start_epoch
-        self.save_period = save_period
+        self.start_epoch = config["start_epoch"]
+        self.saving_period = config["saving_period"]
 
         self.collate_fn = None
 
@@ -275,14 +243,17 @@ class Trainer(Launcher, abc.ABC):
             return self.model
 
     @abc.abstractmethod
-    def run_model(self, datas:list, ldmk_loss_mngr:LossRecorder) -> Union[None, Tensor]:
+    def run_model(self, datas:list) -> Union[None, Tensor]:
         pass
+
+    def backward(self, loss:Tensor):
+        loss.backward()
 
     def save_model_checkpoints(self, save_dir, timestamp):
         '''
         保存模型权重
         '''
-        if self.distribute:
+        if self.distributed:
             torch.save(self.model.module.state_dict(), os.path.join(save_dir, timestamp + '_model.pth'))
         else:
             torch.save(self.model.state_dict(), os.path.join(save_dir, timestamp + '_model.pth'))
@@ -292,13 +263,12 @@ class Trainer(Launcher, abc.ABC):
         前向传播一个epoch
         '''
         desc = "Train" if backward else "Val"
-        ldmk_loss_mngr = LossRecorder(desc)
         if self.skip:
             dataloader = range(len(dataloader))
         progress = tqdm(dataloader, desc=desc, leave=True)
         for datas in progress:
             if not self.skip:
-                loss = self.run_model(datas, ldmk_loss_mngr)
+                loss = self.run_model(datas)
                 if loss is None:
                     continue
                 if torch.isnan(loss).item():
@@ -307,25 +277,24 @@ class Trainer(Launcher, abc.ABC):
                     sys.exit()
                 # 反向传播和优化
                 self.optimizer.zero_grad()
-                if backward and ldmk_loss_mngr.buffer.detect_num > 0 and isinstance(loss, torch.Tensor) and loss.grad_fn is not None:
-                    loss.backward()
+                if backward and isinstance(loss, torch.Tensor) and loss.grad_fn is not None:
+                    self.backward(loss)
             
             if backward:
                 self.optimizer.step()
 
             # 更新进度条信息
-            progress.set_postfix({'Loss': "{:>8.4f}".format(ldmk_loss_mngr.loss()), "Lr": "{:>2.7f}".format(self.optimizer.param_groups[0]["lr"])})
+            progress.set_postfix({'Loss': "{:>8.4f}".format(self.criterion.loss_mngr.last_loss), "Lr": "{:>2.7f}".format(self.optimizer.param_groups[0]["lr"])})
             if TESTFLOW:
                 break
-            ldmk_loss_mngr.buffer.clear()
             
         # 将val_loss写入TensorBoard日志文件
         if backward:
             self.logger.write_epoch("Learning rate", self.optimizer.param_groups[0]["lr"], self.cur_epoch)
-        for key, value in ldmk_loss_mngr.to_dict().items():
+        for key, value in self.criterion.loss_mngr.loss_record.items():
             self.logger.write_epoch(key, value, self.cur_epoch)
 
-        return ldmk_loss_mngr.loss()
+        return self.criterion.loss_mngr.loss()
 
     def train_one_epoch(self, dataloader):
         self.inner_model.train()
@@ -356,7 +325,7 @@ class Trainer(Launcher, abc.ABC):
                 print("new best val_loss: {}, saving...".format(val_loss))
                 self.best_val_loss = val_loss
                 self.save_model_checkpoints(WEIGHTS_DIR, self.start_timestamp)
-            if epoch % self.save_period == 0:
+            if epoch % self.saving_period == 0:
                 self.save_model_checkpoints(WEIGHTS_DIR, self.start_timestamp + f"_{self.cur_epoch}_")
 
             # 更新进度条信息
@@ -366,5 +335,5 @@ class Trainer(Launcher, abc.ABC):
         if _TEST_TRAINER_:
             self.logger.writer.flush()
             self.logger.writer.close()
-        if self.distribute:
+        if self.distributed:
             dist.destroy_process_group()

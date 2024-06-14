@@ -14,9 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from .BaseLauncher import Launcher, BaseLogger
-
-from utils.yaml import load_yaml
-
+from . import load_yaml
 
 class IntermediateManager:
     '''
