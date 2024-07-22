@@ -8,7 +8,6 @@ import platform
 import os
 import shutil
 import datetime
-import pandas as pd
 import time
 
 from typing import Callable

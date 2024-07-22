@@ -1,5 +1,4 @@
 import ruamel.yaml
-import yaml
 import os
 import sys
 
@@ -80,4 +79,4 @@ def dump_yaml(file_path, data):
 
 
 from .Predictor import Predictor
-from .Trainer import Trainer, TrainFlow, TrainFlowKW, TrainerConfig, LossKW, LossManager, LossModule
+from .Trainer import Trainer, TrainFlow, TrainFlowKW, TrainerConfig, LossKW, LossManager, _LossManager

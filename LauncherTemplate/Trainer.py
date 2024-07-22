@@ -15,7 +15,6 @@ from torch.optim.lr_scheduler import LambdaLR
 
 import numpy as np
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import datetime
 import platform
 import sys
@@ -23,7 +22,7 @@ import sys
 import time
 import abc
 
-from typing import Union, TypedDict
+from typing import Union, TypedDict, Callable, Optional, Iterable
 sys_name = platform.system()
 if sys_name == "Windows":
     TESTFLOW = False
@@ -39,7 +38,7 @@ class TrainFlow():
     '''
     训练流程
     '''
-    def __init__(self, trainer:"Trainer", flowfile:str|dict[int, TrainFlowKW]) -> None:
+    def __init__(self, trainer:"Trainer", flowfile:Union[str,dict[int, TrainFlowKW]]) -> None:
         self.trainer = trainer
         self.epoch = 0
         if isinstance(flowfile, dict):
@@ -113,68 +112,108 @@ class TrainLogger(BaseLogger):
         with open(log_file, 'a') as f:
             f.write(log_line)
 
-class LossModule(nn.Module):
-    """
-    method `run` and `get_batch_size` must be overrided
-    """
-    def __init__(self, loss_names:list[str], *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.loss_mngr = LossManager(f"Loss-{self.__class__.__name__}", loss_names)
+class LossManager():
+    def __init__(self, loss:Optional[Callable] = None, losspart_names:Optional[Iterable[str]] = None) -> None:
+        self.loss_module = loss
+        self._mode:bool = True
+        self.losspart_names = losspart_names if losspart_names is not None else []
+        self.train_loss_mngr = _LossManager(self.losspart_names)
+        self.val_loss_mngr   = _LossManager(self.losspart_names)
 
-    def run(self, *args, **kwargs) -> tuple[Tensor]:
-        """
-        Return a tuple of losses, each Tensor in the tuple is the average of a specific loss item
-        """
-        pass
+    @property
+    def mode_str(self):
+        if self._mode:
+            return "train"
+        else:
+            return "val"
 
+    @property
+    def loss_mngr(self):
+        if self._mode:
+            return self.train_loss_mngr
+        else:
+            return self.val_loss_mngr
+    
     def get_batch_size(self, *args, **kwargs) -> int:
-        pass
+        return args[0].shape[0]
 
-    def forward(self, *args, **kwargs):
-        B = self.get_batch_size(*args, **kwargs)
-        losses = self.run(*args, **kwargs)
-        assert len(losses) == len(self.loss_mngr.loss_names), f"losses:{len(losses)} != loss_names:{len(self.loss_mngr.loss_names)}"
-        self.loss_mngr.record(losses, B)
+    def __call__(self, *args, BATCHSIZE = None, **kwargs):
+        B = self.get_batch_size(*args, **kwargs) if BATCHSIZE is None else BATCHSIZE
+        if self.loss_module is None:
+            losses = args[0]
+        else:
+            losses:Union[tuple[Tensor], dict[str, Tensor], Tensor] = self.loss_module(*args, **kwargs)
+        
+        if isinstance(losses, (tuple, dict)):
+            # multiple loss items
+            assert len(losses) == len(self.losspart_names), f"expect {len(self.losspart_names)} loss items, but got {len(losses)} items"
+            if isinstance(losses, tuple):
+                losses = {k: v for k, v in zip(self.losspart_names, losses)}
+            self.loss_mngr.record(losses, B)
+        elif isinstance(losses, Tensor):
+            _len = len(self.losspart_names)
+            assert _len == 1 or _len == 0, f"expect 1 or 0 loss item, but got {len(self.loss_mngr.__loss_names)} items"
+            if _len == 1:
+                losses = {k: v for k, v in zip(self.losspart_names, [losses])}
+            elif _len == 0:
+                losses = {LossKW.LOSS: losses}
+            self.loss_mngr.record(losses, B)
+        else:
+            raise ValueError(f"losses type:{type(losses)} not supported")
 
-        return torch.sum(torch.stack(losses))
+        return self.loss_mngr.loss
+
+    def train_mode(self, value = True):
+        self._mode:bool = value
+
+    def val_mode(self, value = True):
+        self._mode:bool = not value
 
 class LossKW(TypedDict):
     LOSS    = "Loss"
 
-class LossManager():
+class _LossManager():
     '''
     记录总损失
     添加每一个batch的损失
     '''
-    def __init__(self, name:str, loss_names:tuple[str]) -> None:
-        self.name = name
-        self.loss_sum:Tensor = torch.Tensor([0.0])
-        self.loss_record:dict[float] = {}
-        self.loss_names = loss_names
-        self.loss_record[LossKW.LOSS] = 0.0
+    def __init__(self, loss_names:tuple[str]) -> None:
+        self.loss_record:dict[str, Tensor] = {}
+        self.__loss_names = loss_names
+        self.loss_record[LossKW.LOSS] = torch.tensor(0.0)
+        for key in loss_names:
+            self.loss_record[key] = torch.tensor(0.0)
         self._total_num:int = 0
-        self._last_loss = 0.0
+        self._last_loss = torch.tensor(0.0)
 
     @property
     def loss(self):
         return self.loss_record[LossKW.LOSS]
     
     @property
-    def last_loss(self):
-        return self._last_loss
+    def loss_value(self):
+        return float(self.loss_record[LossKW.LOSS].item())
 
-    def record(self, losses:tuple[Tensor], num:int):
-        self._last_loss = torch.sum(torch.stack(losses)).item()
-        for key, value in zip(self.loss_names, losses):
-            self.loss_record.setdefault(key, 0.0)            
+    @property
+    def last_loss_value(self):
+        return float(self._last_loss.item())
+
+    def record(self, losses:dict[str, Tensor], num:int):
+        self._last_loss = self.loss
+        # self._last_loss = torch.sum(torch.stack(losses)).item()
+        for key, value in losses.items():
+            if key not in self.__loss_names:
+                raise ValueError(f"loss name:{key} not in {self.__loss_names}")
             new_losss = (self.loss_record[key] * self._total_num + value * num) / (self._total_num + num)
             self.loss_record[key] = new_losss
         self._total_num += num
 
+        loss_parts = [v for k, v in self.loss_record.items() if k is not LossKW.LOSS]
+        self.loss_record[LossKW.LOSS] = torch.sum(torch.stack(loss_parts))
+
     def clear(self):
-        self.loss_sum[:] = 0
         for k in self.loss_record:
-            self.loss_record[k] = 0.0
+            self.loss_record[k] = torch.tensor(0.0)
         self._total_num = 0
 
 class TrainerConfig(TypedDict):
@@ -196,7 +235,7 @@ class Trainer(Launcher, abc.ABC):
                  model:nn.Module,
                  train_dataset,
                  val_dataset,
-                 criterion: LossModule,
+                 criterion: Union[Callable, nn.Module, LossManager],
                  config:TrainerConfig):
         super().__init__(model, config["batch_size"])
         self.model = model
@@ -216,7 +255,9 @@ class Trainer(Launcher, abc.ABC):
         self.model = self.model.to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters())  # 初始化优化器
-        self.criterion:LossModule = criterion
+        if not isinstance(criterion, LossManager):
+            criterion = LossManager(criterion)
+        self.criterion:LossManager = criterion
 
         self.best_val_loss = float('inf')  # 初始化最佳验证损失为正无穷大
 
@@ -284,7 +325,7 @@ class Trainer(Launcher, abc.ABC):
                 self.optimizer.step()
 
             # 更新进度条信息
-            progress.set_postfix({'Loss': "{:>8.4f}".format(self.criterion.loss_mngr.last_loss), "Lr": "{:>2.7f}".format(self.optimizer.param_groups[0]["lr"])})
+            progress.set_postfix({'Loss': "{:>8.4f}".format(self.criterion.loss_mngr.last_loss_value), "Lr": "{:>2.7f}".format(self.optimizer.param_groups[0]["lr"])})
             if TESTFLOW:
                 break
             
@@ -292,16 +333,18 @@ class Trainer(Launcher, abc.ABC):
         if backward:
             self.logger.write_epoch("Learning rate", self.optimizer.param_groups[0]["lr"], self.cur_epoch)
         for key, value in self.criterion.loss_mngr.loss_record.items():
-            self.logger.write_epoch(key, value, self.cur_epoch)
+            self.logger.write_epoch(self.criterion.mode_str + '-' + key, value, self.cur_epoch)
 
-        return self.criterion.loss_mngr.loss()
+        return self.criterion.loss_mngr.loss_value
 
     def train_one_epoch(self, dataloader):
         self.inner_model.train()
+        self.criterion.train_mode(True)
         return self.forward_one_epoch(dataloader, True)
 
     def val_one_epoch(self, dataloader):
         self.inner_model.eval()
+        self.criterion.train_mode(False)
         with torch.no_grad():
             return self.forward_one_epoch(dataloader, False)
 

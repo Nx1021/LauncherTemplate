@@ -10,5 +10,3 @@ weights/
 *.npy
 *.npz
 __pycache__/
-LauncherTemplate.egg-info/
-build/
