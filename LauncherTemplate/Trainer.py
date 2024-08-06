@@ -143,23 +143,23 @@ class LossManager():
             losses = args[0]
         else:
             losses:Union[tuple[Tensor], dict[str, Tensor], Tensor] = self.loss_module(*args, **kwargs)
-        
-        if isinstance(losses, (tuple, dict)):
-            # multiple loss items
-            assert len(losses) == len(self.losspart_names), f"expect {len(self.losspart_names)} loss items, but got {len(losses)} items"
-            if isinstance(losses, tuple):
-                losses = {k: v for k, v in zip(self.losspart_names, losses)}
-            self.loss_mngr.record(losses, B)
-        elif isinstance(losses, Tensor):
-            _len = len(self.losspart_names)
-            assert _len == 1 or _len == 0, f"expect 1 or 0 loss item, but got {len(self.loss_mngr.__loss_names)} items"
-            if _len == 1:
-                losses = {k: v for k, v in zip(self.losspart_names, [losses])}
-            elif _len == 0:
-                losses = {LossKW.LOSS: losses}
-            self.loss_mngr.record(losses, B)
-        else:
-            raise ValueError(f"losses type:{type(losses)} not supported")
+        with torch.no_grad():
+            if isinstance(losses, (tuple, dict)):
+                # multiple loss items
+                assert len(losses) == len(self.losspart_names), f"expect {len(self.losspart_names)} loss items, but got {len(losses)} items"
+                if isinstance(losses, tuple):
+                    losses = {k: v for k, v in zip(self.losspart_names, losses)}
+                self.loss_mngr.record(losses, B)
+            elif isinstance(losses, Tensor):
+                _len = len(self.losspart_names)
+                assert _len == 1 or _len == 0, f"expect 1 or 0 loss item, but got {len(self.loss_mngr.__loss_names)} items"
+                if _len == 1:
+                    losses = {k: v for k, v in zip(self.losspart_names, [losses])}
+                elif _len == 0:
+                    losses = {LossKW.LOSS: losses}
+                self.loss_mngr.record(losses, B)
+            else:
+                raise ValueError(f"losses type:{type(losses)} not supported")
 
         return self.loss_mngr.loss
 
@@ -184,7 +184,7 @@ class _LossManager():
         for key in loss_names:
             self.loss_record[key] = torch.tensor(0.0)
         self._total_num:int = 0
-        self._last_loss = torch.tensor(0.0)
+        self._last_loss = 0.0
 
     @property
     def loss(self):
@@ -196,10 +196,11 @@ class _LossManager():
 
     @property
     def last_loss_value(self):
-        return float(self._last_loss.item())
+        return self._last_loss
 
     def record(self, losses:dict[str, Tensor], num:int):
-        self._last_loss = self.loss
+        # TODO: 逻辑没有理清楚，record模块只应该用于记录，不应该计算
+        self._last_loss = float(self.loss.item())
         # self._last_loss = torch.sum(torch.stack(losses)).item()
         for key, value in losses.items():
             if key not in self.__loss_names:
@@ -212,7 +213,8 @@ class _LossManager():
         self.loss_record[LossKW.LOSS] = torch.sum(torch.stack(loss_parts))
 
     def clear(self):
-        for k in self.loss_record:
+        for k in list(self.loss_record.keys()):
+            del self.loss_record[k]
             self.loss_record[k] = torch.tensor(0.0)
         self._total_num = 0
 
@@ -289,6 +291,13 @@ class Trainer(Launcher, abc.ABC):
 
     def backward(self, loss:Tensor):
         loss.backward()
+        self.optimizer.step()
+
+    def loss_nan_process(self, loss:Tensor):
+        print("loss nan, continue! zero grad")
+        self.optimizer.zero_grad()
+        torch.cuda.empty_cache()
+        return True
 
     def save_model_checkpoints(self, save_dir, timestamp):
         '''
@@ -313,16 +322,19 @@ class Trainer(Launcher, abc.ABC):
                 if loss is None:
                     continue
                 if torch.isnan(loss).item():
-                    print("loss nan, break!")
-                    self.save_model_checkpoints(WEIGHTS_DIR, self.start_timestamp)
-                    sys.exit()
+                    print("loss nan, continue! zero grad")
+                    if_continue = self.loss_nan_process(loss)
+                    if if_continue:
+                        continue
+                    else:
+                        break
                 # 反向传播和优化
                 self.optimizer.zero_grad()
                 if backward and isinstance(loss, torch.Tensor) and loss.grad_fn is not None:
                     self.backward(loss)
             
-            if backward:
-                self.optimizer.step()
+            # if backward:
+            #     self.optimizer.step()
 
             # 更新进度条信息
             progress.set_postfix({'Loss': "{:>8.4f}".format(self.criterion.loss_mngr.last_loss_value), "Lr": "{:>2.7f}".format(self.optimizer.param_groups[0]["lr"])})
@@ -340,19 +352,23 @@ class Trainer(Launcher, abc.ABC):
     def train_one_epoch(self, dataloader):
         self.inner_model.train()
         self.criterion.train_mode(True)
+        self.criterion.loss_mngr.clear()
         return self.forward_one_epoch(dataloader, True)
 
     def val_one_epoch(self, dataloader):
         self.inner_model.eval()
         self.criterion.train_mode(False)
+        self.criterion.loss_mngr.clear()
         with torch.no_grad():
             return self.forward_one_epoch(dataloader, False)
 
     def train(self):
         print("start to train... time:{}".format(self.start_timestamp))
         self.cur_epoch = 0
-        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,  collate_fn=self.collate_fn)
-        val_dataloader   = DataLoader(self.val_dataset,   batch_size=self.batch_size, shuffle=False, collate_fn=self.collate_fn)
+        num_workers = 0 if sys_name == "Windows" else 4
+        shuffle_training = self.config.get('shuffle_training', True)
+        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=shuffle_training,  collate_fn=self.collate_fn, num_workers = num_workers)
+        val_dataloader   = DataLoader(self.val_dataset,   batch_size=self.batch_size, shuffle=False, collate_fn=self.collate_fn, num_workers = num_workers)
 
         for epoch in self.flow:
             self.cur_epoch = epoch
@@ -380,3 +396,5 @@ class Trainer(Launcher, abc.ABC):
             self.logger.writer.close()
         if self.distributed:
             dist.destroy_process_group()
+        if self.config.get("empty_cache", False):
+            torch.cuda.empty_cache()
