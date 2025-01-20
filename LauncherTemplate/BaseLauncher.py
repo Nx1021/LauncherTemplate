@@ -1,8 +1,11 @@
+import torch.utils
+import torch.utils.data
 from . import LOGS_DIR, _get_sub_log_dir, dump_yaml, load_yaml
 
 import torch
 import sys
 import io
+import win32com.client
 from typing import Union
 import platform
 import os
@@ -10,8 +13,17 @@ import shutil
 import datetime
 import time
 
-from typing import Callable
+from typing import Callable, Optional, TypedDict, Generic, TypeVar
 from functools import wraps 
+
+def create_folder_shortcut(folder_path, shortcut_path, description=""):    
+    # 创建快捷方式
+    shell = win32com.client.Dispatch("WScript.Shell")
+    shortcut = shell.CreateShortcut(shortcut_path)
+    shortcut.TargetPath = os.path.normpath(folder_path)
+    shortcut.WorkingDirectory = os.path.normpath(folder_path)
+    shortcut.Description = description
+    shortcut.save()
 
 class BaseLogger():
     def __init__(self, log_dir):
@@ -151,16 +163,30 @@ class FrameTimer():
             obj.print(intent=4)
         print()
 
+class BaseConfig(TypedDict):
+    device:str      = "cuda"
 
-class Launcher():
+    batch_size:int  = 8
+    num_workers:int = 4
+    persistent_workers:bool = False
+
+    distributed:bool = False
+
+
+MODEL_TYPE = TypeVar("MODEL_TYPE", bound=torch.nn.Module)
+class Launcher(Generic[MODEL_TYPE]):
     DONOT_COUNT_BATCH = 0
     COUNT_BY_INPUT_1 = 1
     COUNT_BY_RETURN_1 = -1
 
-    def __init__(self, model, batch_size=32, log_remark = "") -> None:
+    def __init__(self, model, config:BaseConfig, log_remark = "") -> None:
         # 初始化 Launcher 类
-        self.model:torch.Module = model
-        self.batch_size: int = batch_size
+        self.model:MODEL_TYPE = model
+        self.config:BaseConfig = config
+
+        self.device = torch.device(config["device"])
+        self.distributed = config["distributed"]
+        self.batch_size: int = config["batch_size"]
         self.sys: str = platform.system()
 
         # 获取当前时间戳，并创建日志保存目录
@@ -168,11 +194,23 @@ class Launcher():
         self.start_timestamp: str = current_time.strftime("%Y%m%d%H%M%S")
         self.log_root: str  = _get_sub_log_dir(self.__class__)
         self.log_dir: str   = self.log_root + self.start_timestamp + self.sys
+        self._log_sub_dir   = self.start_timestamp + self.sys
         if log_remark != '':
             self.log_dir += '_' + log_remark # TensorBoard日志文件保存目录
         os.makedirs(self.log_dir, exist_ok=True)
 
+        # timer for each function, used to record the time cost of each function
         self.frame_timer = FrameTimer()
+
+        self.collate_fn = None
+        self._dataloader_type = torch.utils.data.DataLoader
+
+        if self.distributed:
+            # 初始化分布式环境
+            dist.init_process_group(backend='nccl', init_method='tcp://localhost:23456', world_size=torch.cuda.device_count(), rank=torch.cuda.current_device())
+            self.model = torch.nn.parallel.DistributedDataParallel(self.model)
+        self.model = self.model.to(self.device)
+
 
     @staticmethod
     def timing(count_batch_from = DONOT_COUNT_BATCH):

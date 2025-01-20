@@ -1,7 +1,10 @@
-from . import SCRIPT_DIR, WEIGHTS_DIR, load_yaml
-from .BaseLauncher import BaseLogger, Launcher
+import torch.utils
+import torch.utils.data
+from . import SCRIPT_DIR, WEIGHTS_DIR, load_yaml, LOGS_DIR
+from .BaseLauncher import BaseLogger, Launcher, create_folder_shortcut, MODEL_TYPE
 
 import os
+import win32com.client
 import torch
 from torch import Tensor
 import torch.distributed as dist
@@ -22,7 +25,7 @@ import sys
 import time
 import abc
 
-from typing import Union, TypedDict, Callable, Optional, Iterable
+from typing import Union, TypedDict, Callable, Optional, Iterable, Generic, TypeVar
 sys_name = platform.system()
 if sys_name == "Windows":
     TESTFLOW = False
@@ -97,8 +100,15 @@ class TrainLogger(BaseLogger):
     def __init__(self, log_dir):
         super().__init__(log_dir)
         self.writer = SummaryWriter(log_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        self._on = True
+
+    def set_logger_on(self, value = True):
+        self._on = value
 
     def write_epoch(self, tag, value, step):
+        if not self._on:
+            return
         if isinstance(value, torch.Tensor):
             value = value.item()
         # 写入 SummaryWriter
@@ -111,14 +121,27 @@ class TrainLogger(BaseLogger):
 
         with open(log_file, 'a') as f:
             f.write(log_line)
+    
+    def flush_log(self):
+        if not self._on:
+            return
+        self.writer.flush()
+        self.writer.close()
 
-class LossManager():
+LOSSMODULE = TypeVar("LOSSMODULE", bound=nn.Module)
+class LossManager(Generic[LOSSMODULE]):
     def __init__(self, loss:Optional[Callable] = None, losspart_names:Optional[Iterable[str]] = None) -> None:
-        self.loss_module = loss
+        self.loss_module:LOSSMODULE = loss
         self._mode:bool = True
-        self.losspart_names = losspart_names if losspart_names is not None else []
-        self.train_loss_mngr = _LossManager(self.losspart_names)
-        self.val_loss_mngr   = _LossManager(self.losspart_names)
+        self.losspart_names = losspart_names 
+        if self.losspart_names is not None:
+            self.init_loss_mngr(self.losspart_names)
+        else:
+            self.init_loss_mngr([])
+
+    def init_loss_mngr(self, losspart_names:Iterable[str]):
+        self.train_loss_mngr = _LossManager(losspart_names)
+        self.val_loss_mngr   = _LossManager(losspart_names)
 
     @property
     def mode_str(self):
@@ -146,22 +169,29 @@ class LossManager():
         with torch.no_grad():
             if isinstance(losses, (tuple, dict)):
                 # multiple loss items
+                if self.losspart_names is None:
+                    self.losspart_names = [f"loss_{i}" for i in range(len(losses))]
+                    self.init_loss_mngr(self.losspart_names)
                 assert len(losses) == len(self.losspart_names), f"expect {len(self.losspart_names)} loss items, but got {len(losses)} items"
                 if isinstance(losses, tuple):
                     losses = {k: v for k, v in zip(self.losspart_names, losses)}
                 self.loss_mngr.record(losses, B)
             elif isinstance(losses, Tensor):
+                if self.losspart_names is None:
+                    self.losspart_names = ["loss"]
+                    self.init_loss_mngr(self.losspart_names)
                 _len = len(self.losspart_names)
-                assert _len == 1 or _len == 0, f"expect 1 or 0 loss item, but got {len(self.loss_mngr.__loss_names)} items"
-                if _len == 1:
-                    losses = {k: v for k, v in zip(self.losspart_names, [losses])}
-                elif _len == 0:
-                    losses = {LossKW.LOSS: losses}
+                assert _len == 1, f"expect 1 loss item, but got {_len} items"
+                losses = {k: v for k, v in zip(self.losspart_names, [losses])}
                 self.loss_mngr.record(losses, B)
             else:
                 raise ValueError(f"losses type:{type(losses)} not supported")
-
-        return self.loss_mngr.loss
+        
+        if self._mode:
+            loss_ = torch.sum(torch.stack([v for k, v in losses.items() if v.grad_fn is not None]))
+        else:
+            loss_ = torch.sum(torch.stack([v for k, v in losses.items()]))
+        return loss_
 
     def train_mode(self, value = True):
         self._mode:bool = value
@@ -219,9 +249,10 @@ class _LossManager():
         self._total_num = 0
 
 class TrainerConfig(TypedDict):
-    device:str = "cuda"
+    device:str      = "cuda"
 
-    batch_size:int = 8
+    batch_size:int  = 8
+    num_workers:int = 4
 
     start_epoch:int = 0
     train_flow:dict[int, TrainFlowKW] = {}
@@ -232,34 +263,25 @@ class TrainerConfig(TypedDict):
 
 _TEST_TRAINER_ = False
 
-class Trainer(Launcher, abc.ABC):
+MODEL_TYPE = TypeVar("MODEL_TYPE", bound=nn.Module)
+LOSS_TYPE  = TypeVar("LOSS_TYPE", bound=nn.Module)
+class Trainer(Launcher[MODEL_TYPE], abc.ABC, Generic[MODEL_TYPE, LOSS_TYPE]):
     def __init__(self,
-                 model:nn.Module,
+                 model:MODEL_TYPE,
                  train_dataset,
                  val_dataset,
                  criterion: Union[Callable, nn.Module, LossManager],
                  config:TrainerConfig):
-        super().__init__(model, config["batch_size"])
-        self.model = model
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
-        self.config = config
+        super().__init__(model, config)
+        self.train_dataset:torch.utils.data.Dataset = train_dataset
+        self.val_dataset:torch.utils.data.Dataset   = val_dataset
 
         self.flow = TrainFlow(self, config["train_flow"])
-        self.distributed = config["distributed"]
-
-        if self.distributed:
-            # 初始化分布式环境
-            dist.init_process_group(backend='nccl', init_method='tcp://localhost:23456', world_size=torch.cuda.device_count(), rank=torch.cuda.current_device())
-            self.model = torch.nn.parallel.DistributedDataParallel(self.model)
-
-        self.device = torch.device(config["device"])
-        self.model = self.model.to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters())  # 初始化优化器
         if not isinstance(criterion, LossManager):
             criterion = LossManager(criterion)
-        self.criterion:LossManager = criterion
+        self.criterion:LossManager[LOSS_TYPE] = criterion
 
         self.best_val_loss = float('inf')  # 初始化最佳验证损失为正无穷大
 
@@ -268,10 +290,9 @@ class Trainer(Launcher, abc.ABC):
             self.logger = TrainLogger(self.log_dir)
 
         self.cur_epoch = 0
-        self.start_epoch = config["start_epoch"]
-        self.saving_period = config["saving_period"]
-
-        self.collate_fn = None
+        self.start_epoch    = config["start_epoch"]
+        self.saving_period  = config["saving_period"]
+        self._training_forward = True
 
     @property
     def skip(self):
@@ -307,16 +328,23 @@ class Trainer(Launcher, abc.ABC):
             torch.save(self.model.module.state_dict(), os.path.join(save_dir, timestamp + '_model.pth'))
         else:
             torch.save(self.model.state_dict(), os.path.join(save_dir, timestamp + '_model.pth'))
+        short_cut_path = os.path.join(WEIGHTS_DIR, self._log_sub_dir+'_training_logs.lnk')
+        if not os.path.exists(short_cut_path):
+            create_folder_shortcut(self.log_dir, short_cut_path, "link of logs")
 
-    def forward_one_epoch(self, dataloader:DataLoader, backward = False):
+    def forward_one_epoch(self, dataloader:DataLoader, _training_forward = False):
         '''
         前向传播一个epoch
         '''
-        desc = "Train" if backward else "Val"
+        self._training_forward = _training_forward
+        desc = "Train" if _training_forward else "Val"
         if self.skip:
             dataloader = range(len(dataloader))
         progress = tqdm(dataloader, desc=desc, leave=True)
         for datas in progress:
+            if self.skip:
+                progress.set_postfix({'SKIP': "True"})
+                break
             if not self.skip:
                 loss = self.run_model(datas)
                 if loss is None:
@@ -330,7 +358,7 @@ class Trainer(Launcher, abc.ABC):
                         break
                 # 反向传播和优化
                 self.optimizer.zero_grad()
-                if backward and isinstance(loss, torch.Tensor) and loss.grad_fn is not None:
+                if _training_forward and isinstance(loss, torch.Tensor) and loss.grad_fn is not None:
                     self.backward(loss)
             
             # if backward:
@@ -342,7 +370,7 @@ class Trainer(Launcher, abc.ABC):
                 break
             
         # 将val_loss写入TensorBoard日志文件
-        if backward:
+        if _training_forward:
             self.logger.write_epoch("Learning rate", self.optimizer.param_groups[0]["lr"], self.cur_epoch)
         for key, value in self.criterion.loss_mngr.loss_record.items():
             self.logger.write_epoch(self.criterion.mode_str + '-' + key, value, self.cur_epoch)
@@ -361,18 +389,24 @@ class Trainer(Launcher, abc.ABC):
         self.criterion.loss_mngr.clear()
         with torch.no_grad():
             return self.forward_one_epoch(dataloader, False)
-
+    
     def train(self):
         print("start to train... time:{}".format(self.start_timestamp))
         self.cur_epoch = 0
-        num_workers = 0 if sys_name == "Windows" else 4
+        # num_workers = 0 if sys_name == "Windows" else 4
+        num_workers = self.config.get("num_workers", 0)
+        persistent_workers = self.config.get("persistent_workers", True)
+        persistent_workers = False if num_workers == 0 else persistent_workers
         shuffle_training = self.config.get('shuffle_training', True)
-        train_dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=shuffle_training,  collate_fn=self.collate_fn, num_workers = num_workers)
-        val_dataloader   = DataLoader(self.val_dataset,   batch_size=self.batch_size, shuffle=False, collate_fn=self.collate_fn, num_workers = num_workers)
+        train_dataloader = self._dataloader_type(self.train_dataset, batch_size=self.batch_size, shuffle=shuffle_training,  
+                                      collate_fn=self.collate_fn, num_workers = num_workers, pin_memory=True, persistent_workers = persistent_workers)
+        val_dataloader   = self._dataloader_type(self.val_dataset,   batch_size=self.batch_size, shuffle=False, 
+                                      collate_fn=self.collate_fn, num_workers = num_workers, pin_memory=True, persistent_workers = persistent_workers)
 
         for epoch in self.flow:
             self.cur_epoch = epoch
-            tqdm.write('\nEpoch {} start...'.format(self.cur_epoch))
+            start_time = time.time()
+            tqdm.write('\nEpoch {} start... time: {}'.format(self.cur_epoch, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
             # 训练阶段
             train_loss = self.train_one_epoch(train_dataloader)
 
@@ -388,7 +422,10 @@ class Trainer(Launcher, abc.ABC):
                 self.save_model_checkpoints(WEIGHTS_DIR, self.start_timestamp + f"_{self.cur_epoch}_")
 
             # 更新进度条信息
-            tqdm.write('Epoch {} - Train Loss: {:.4f} - Val Loss: {:.4f}'.format(self.cur_epoch, train_loss, val_loss))
+            time_cost = time.time() - start_time
+            time_cost_str = "{}h {}m {}s".format(int(time_cost // 3600), int(time_cost % 3600 // 60), int(time_cost % 60))
+            tqdm.write('Epoch {} - Train Loss: {:.4f} - Val Loss: {:.4f}; time: {}; Epoch time cost:{}'.format(self.cur_epoch, train_loss, val_loss, 
+                                                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), time_cost_str))
 
         # 保存TensorBoard日志文件
         if _TEST_TRAINER_:
@@ -398,3 +435,22 @@ class Trainer(Launcher, abc.ABC):
             dist.destroy_process_group()
         if self.config.get("empty_cache", False):
             torch.cuda.empty_cache()
+    
+    def val(self):
+        print("start to val... time:{}".format(self.start_timestamp))
+        self.cur_epoch = 1
+        num_workers = self.config.get("num_workers", 0)
+        persistent_workers = self.config.get("persistent_workers", True)
+        persistent_workers = False if num_workers == 0 else persistent_workers
+        val_dataloader   = self._dataloader_type(self.val_dataset,   batch_size=self.batch_size, shuffle=False, 
+                                      collate_fn=self.collate_fn, num_workers = num_workers, pin_memory=True, persistent_workers = persistent_workers)
+        
+        start_time = time.time()
+        tqdm.write('\nValidation start... time: {}'.format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        val_loss = self.val_one_epoch(val_dataloader)
+        print("val_loss: {}".format(val_loss))
+        time_cost = time.time() - start_time
+        time_cost_str = "{}h {}m {}s".format(int(time_cost // 3600), int(time_cost % 3600 // 60), int(time_cost % 60))
+        tqdm.write('Val Loss: {:.4f}; time: {}; Epoch time cost:{}'.format(val_loss, 
+                                            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), time_cost_str))
+        
