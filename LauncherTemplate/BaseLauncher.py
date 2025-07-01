@@ -13,8 +13,10 @@ import shutil
 import datetime
 import time
 
-from typing import Callable, Optional, TypedDict, Generic, TypeVar
+from typing import Callable, Optional, TypedDict, Generic, TypeVar, Literal
 from functools import wraps 
+
+from torch.utils.data import DataLoader, Dataset
 
 def create_folder_shortcut(folder_path, shortcut_path, description=""):    
     # 创建快捷方式
@@ -172,31 +174,67 @@ class BaseConfig(TypedDict):
 
     distributed:bool = False
 
+class dataset_getitem_decorator():
+    def __init__(self, func:Callable):
+        self.func = func
+
+    def __call__(self, idx):
+        datas = self.func(idx)
+        return datas, idx
+
+class collate_fn_decorator():
+    def __init__(self, func:Callable):
+        self.func = func
+
+    def __call__(self, datas):
+        _d = self.func([x[0] for x in datas])
+        _i = torch.stack([torch.tensor(x[-1]) for x in datas])
+        return _d, _i
+
+DATASET_TYPE = TypeVar("DATASET_TYPE", bound=torch.utils.data.Dataset)
+class _DatasetWrapper(Dataset, Generic[DATASET_TYPE]):
+    def __init__(self, dataset:DATASET_TYPE):
+        super().__init__()
+        self.dataset:DATASET_TYPE = dataset
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        return self.dataset[idx], idx
 
 MODEL_TYPE = TypeVar("MODEL_TYPE", bound=torch.nn.Module)
 class Launcher(Generic[MODEL_TYPE]):
     DONOT_COUNT_BATCH = 0
     COUNT_BY_INPUT_1 = 1
     COUNT_BY_RETURN_1 = -1
+    LAUNCHER_NAME = ["Trainer", "Predictor"]
 
-    def __init__(self, model, config:BaseConfig, log_remark = "") -> None:
+    def __init_subclass__(cls):
+        if Launcher in cls.__bases__:
+            if cls.__name__ not in cls.LAUNCHER_NAME:
+                raise ValueError(f"Subclass name must be one of {cls.LAUNCHER_NAME}, but got '{cls.__name__}'")
+            else:
+                cls._launcher_name = cls.__name__
+        return super().__init_subclass__()
+
+    def __init__(self, model, config:BaseConfig, log_dir:Optional[str] = None) -> None:
         # 初始化 Launcher 类
         self.model:MODEL_TYPE = model
         self.config:BaseConfig = config
 
-        self.device = torch.device(config["device"])
-        self.distributed = config["distributed"]
-        self.batch_size: int = config["batch_size"]
+        self.device = torch.device(config.get("device", "cuda"))
+        self.distributed = config.get("distributed", False)
+        self.batch_size: int  = config.get("batch_size",  8)
+        self.num_workers: int = config.get("num_workers", 0)
         self.sys: str = platform.system()
 
         # 获取当前时间戳，并创建日志保存目录
         current_time = datetime.datetime.now()
         self.start_timestamp: str = current_time.strftime("%Y%m%d%H%M%S")
         self.log_root: str  = _get_sub_log_dir(self.__class__)
-        self.log_dir: str   = self.log_root + self.start_timestamp + self.sys
-        self._log_sub_dir   = self.start_timestamp + self.sys
-        if log_remark != '':
-            self.log_dir += '_' + log_remark # TensorBoard日志文件保存目录
+        self._log_sub_dir   = self.start_timestamp + self.sys if log_dir is None else log_dir
+        self.log_dir: str   = os.path.join(self.log_root, self._log_sub_dir)
         os.makedirs(self.log_dir, exist_ok=True)
 
         # timer for each function, used to record the time cost of each function
@@ -205,12 +243,27 @@ class Launcher(Generic[MODEL_TYPE]):
         self.collate_fn = None
         self._dataloader_type = torch.utils.data.DataLoader
 
-        if self.distributed:
+        if self.distributed and model is not None:
             # 初始化分布式环境
             dist.init_process_group(backend='nccl', init_method='tcp://localhost:23456', world_size=torch.cuda.device_count(), rank=torch.cuda.current_device())
             self.model = torch.nn.parallel.DistributedDataParallel(self.model)
-        self.model = self.model.to(self.device)
+        self.model = self.model.to(self.device) if model is not None else None
+        self.model._is_training = self._is_training
 
+    def _is_training(self):
+        # 检查当前是否处于训练模式
+        return self.__class__._launcher_name == "Trainer"
+
+    # @property
+    # def collate_fn(self, dataset):
+    #     if self.collate_fn is None:
+    #         return dataset.collate_fn
+    #     return self.collate_fn
+    
+    # @collate_fn.setter
+    # def collate_fn(self, value:Callable):
+    #     assert callable(value)
+    #     self.collate_fn = collate_fn_decorator(value)
 
     @staticmethod
     def timing(count_batch_from = DONOT_COUNT_BATCH):
@@ -246,4 +299,22 @@ class Launcher(Generic[MODEL_TYPE]):
             return wrapper
         return decorator
 
+    # def _dataloader_decorator(self, dataloader:DataLoader):
+    #     def _next_index_next_index(func):
+    #         def warpper():
+    #             index = func()
+    #             self._temp_next_index_value = index
+    #             return index
+    #         return warpper
 
+    #     dataloader_iter = dataloader.__iter__()
+    #     dataloader_iter._next_index = _next_index_next_index(dataloader_iter._next_index)
+    #     while True:
+    #         try:
+    #             datas = next(dataloader_iter)
+    #         except StopIteration:
+    #             break
+    #         yield datas
+    
+    # def _query_data_index(self, dataloader:DataLoader):
+    #     return self._temp_next_index_value

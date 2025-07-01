@@ -8,7 +8,7 @@ def load_requirements(filename: str):
 
 setup(
     name='LauncherTemplate',
-    version='0.0.2',
+    version='0.2',
     packages=find_packages(),
     install_requires= load_requirements("requirements.txt"),
     author='NX',
