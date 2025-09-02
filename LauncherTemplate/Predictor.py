@@ -116,7 +116,7 @@ class Predictor(Launcher[MODEL_TYPE], Generic[MODEL_TYPE, DATASET_TYPE]):
                                     collate_fn=self.collate_fn, num_workers = num_workers, pin_memory=False, persistent_workers = persistent_workers)
         dataloader.collate_fn = collate_fn_decorator(dataloader.collate_fn)
         
-        
+        self.model.eval()
         self.precision_recorder.clear() # clear the recorder
 
         progress = tqdm(dataloader, desc="Predict", leave=True)

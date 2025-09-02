@@ -363,7 +363,8 @@ class Trainer(Launcher[MODEL_TYPE], abc.ABC, Generic[MODEL_TYPE, LOSS_TYPE, DATA
                  train_dataset:DATASET_TYPE,
                  val_dataset:DATASET_TYPE,
                  criterion: Union[Callable, nn.Module, LossManager],
-                 config:TrainerConfig):
+                 config:TrainerConfig,
+                 log_dir:Optional[str] = None):
         """
         Args:
             model (MODEL_TYPE|nn.Module): the model to be trained
@@ -372,9 +373,12 @@ class Trainer(Launcher[MODEL_TYPE], abc.ABC, Generic[MODEL_TYPE, LOSS_TYPE, DATA
             criterion (Union[Callable, nn.Module, LossManager]): loss module, it will be converted to a `LossManager` if it is not a `LossManager`
             config (TrainerConfig): 
         """
-        super().__init__(model, config)
+        super().__init__(model, config, log_dir)
         self._train_dataset = _DatasetWrapper(train_dataset)
         self._val_dataset   = _DatasetWrapper(val_dataset)
+
+        self.logger = BaseLogger(self.log_dir)
+        self.logger.log(config)
 
         self.flow = TrainFlow(self, config["train_flow"])
 
