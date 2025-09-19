@@ -19,6 +19,7 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(os.path.join(LOGS_DIR, '_temp'), exist_ok=True)
 os.makedirs(WEIGHTS_DIR, exist_ok=True)
 
+
 def _get_sub_log_dir(type):
     return f"{LOGS_DIR}/{type.__name__}_logs/"
 
@@ -105,3 +106,36 @@ print(f"default GPU idx: {torch.cuda.current_device()}")
 from .utils import load_yaml, dump_yaml, wait_until
 from .Predictor import Predictor
 from .Trainer import Trainer, TrainFlow, TrainFlowKW, TrainerConfig, LossKW, LossManager, _LossManager
+
+
+# save a example config file
+trainer_config_dict:TrainerConfig = {
+    "device": "cuda",
+    "batch_size": 4,
+    "num_workers": 2,
+    "shuffle_training": True,
+    "persistent_workers": True,
+    "empty_cache": True,
+    "start_epoch": 1,
+    "train_flow": {
+        0: {
+            "lr_func": "warmup",
+            "lr": 1e-6,
+            "cfg": {}
+        },
+        5: {
+            "lr_func": "constant",
+            "lr": 1e-6,
+            "cfg": {}
+        },
+        30: {
+            "lr_func": "cosine",
+            "lr": 1e-6,
+            "cfg": {}
+        },
+    },
+    "distributed": False,
+    "saving_period": 10
+}  
+if os.path.exists(os.path.join(CFG_DIR, "trainer_config.yaml")) is False and len(os.listdir(CFG_DIR)) == 0:
+    dump_yaml(os.path.join(CFG_DIR, "trainer_config.yaml"), trainer_config_dict)
